@@ -507,7 +507,7 @@ func TestCoreDNSApplyChanges(t *testing.T) {
 	require.NoError(t, err)
 
 	expectedServices2 := map[string][]*Service{
-		"/skydns/local/domain1": {{Host: "6.6.6.6", Text: "string1"}},
+		"/skydns/local/domain1": {{Host: "6.6.6.6"}},
 		"/skydns/local/domain2": {{Host: "site.local"}},
 		"/skydns/local/domain3": {{Host: "7.7.7.7"}},
 	}
@@ -1500,13 +1500,58 @@ func TestApplyChangesPreventCleanupForKnownLabels(t *testing.T) {
 	coredns.ApplyChanges(t.Context(), changes1)
 
 	expectedServices1 := map[string][]*Service{
-		"/skydns/local/domain1":              {{Host: "5.5.5.5", Key: "/skydns/local/domain1/random", Text: "originalText", TargetStrip: 1}},
+		"/skydns/local/domain1":              {{Host: "5.5.5.5", Key: "/skydns/local/domain1/random", TargetStrip: 1}},
 		"/skydns/local/domain1/originalText": {{Host: "10.0.0.0"}},
 		"/skydns/local/domain1/prefix":       {{Host: "10.0.0.0"}},
 		"/skydns/local/domain1/resource":     {{Host: "10.0.0.0"}},
 		"/skydns/local/domain1/owner":        {{Host: "10.0.0.0"}},
 	}
 	validateServices(client.services, expectedServices1, t, 1)
+}
+
+// Regression test for https://github.com/kubernetes-sigs/external-dns/issues/4953.
+// When a CNAME service exists in etcd with a text field (e.g. from the TXT
+// registry), updating the CNAME target must not carry the old text into the
+// new service entry. CoreDNS cannot resolve CNAMEs whose etcd entry contains
+// a non-empty text field.
+func TestCNAMEUpdateDoesNotLeakText(t *testing.T) {
+	client := &fakeETCDClient{services: map[string]Service{
+		"/skydns/com/mydomain/example1/aabbccdd": {
+			Host:        "example2.mydomain.com",
+			Text:        "heritage=external-dns,external-dns/owner=default",
+			TargetStrip: 1,
+		},
+	}}
+	coredns := coreDNSProvider{
+		client:        client,
+		coreDNSPrefix: defaultCoreDNSPrefix,
+		domainFilter:  endpoint.NewDomainFilter([]string{""}),
+	}
+
+	records, err := coredns.Records(t.Context())
+	require.NoError(t, err)
+
+	var updateOld []*endpoint.Endpoint
+	for _, ep := range records {
+		if ep.RecordType == endpoint.RecordTypeCNAME {
+			updateOld = append(updateOld, ep)
+		}
+	}
+	require.Len(t, updateOld, 1)
+
+	changes := &plan.Changes{
+		UpdateNew: []*endpoint.Endpoint{
+			endpoint.NewEndpoint("example1.mydomain.com", endpoint.RecordTypeCNAME, "example3.mydomain.com"),
+		},
+		UpdateOld: updateOld,
+	}
+	err = coredns.ApplyChanges(t.Context(), changes)
+	require.NoError(t, err)
+
+	expectedServices := map[string][]*Service{
+		"/skydns/com/mydomain/example1": {{Host: "example3.mydomain.com"}},
+	}
+	validateServices(client.services, expectedServices, t, 1)
 }
 
 func TestRecordsAWithGroupServiceTranslation(t *testing.T) {
